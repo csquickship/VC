@@ -1,65 +1,64 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.io = exports.httpServer = exports.app = void 0;
-const http_1 = __importDefault(require("http"));
-const express_1 = __importDefault(require("express"));
-const cors_1 = __importDefault(require("cors"));
-const config_js_1 = require("./config.js");
-const signalingServer_js_1 = require("./signaling/signalingServer.js");
-function log(level, message, meta) {
-    const timestamp = new Date().toISOString();
-    const metaStr = meta ? ` ${JSON.stringify(meta)}` : '';
-    console.log(`[${timestamp}] [${level}] [SERVER] ${message}${metaStr}`);
-}
-const app = (0, express_1.default)();
-exports.app = app;
-// Enable CORS middleware for REST API
-app.use((0, cors_1.default)({
-    origin: config_js_1.config.frontendOrigin,
-    credentials: true,
-}));
-app.use(express_1.default.json());
-// Health check endpoint
-app.get('/health', (_req, res) => {
-    res.status(200).json({ status: 'ok' });
-});
-// Create HTTP server
-const httpServer = http_1.default.createServer(app);
-exports.httpServer = httpServer;
+import http from 'http';
+import { config } from './config/index.js';
+import { log } from './utils/logger.js';
+import { createApp } from './app.js';
+import { createSignalingServer } from './websocket/signalingServer.js';
+import { prisma } from './repositories/postgres/prisma.client.js';
+// Create placeholder HTTP server
+const httpServer = http.createServer();
 // Attach Socket.IO signaling server
-const io = (0, signalingServer_js_1.createSignalingServer)(httpServer);
-exports.io = io;
-// Start server
-httpServer.listen(config_js_1.config.port, () => {
-    log('INFO', `Server listening on port ${config_js_1.config.port}`, {
-        port: config_js_1.config.port,
-        frontendOrigin: config_js_1.config.frontendOrigin,
+const signaling = createSignalingServer(httpServer);
+// Create Express app with meeting-ended notifier hooked to signaling server
+const { app } = createApp({
+    onMeetingEnded: (meetingCode) => {
+        signaling.notifyMeetingEnded(meetingCode);
+    },
+});
+// Attach Express request listener to HTTP server
+httpServer.on('request', app);
+// Start listening on 0.0.0.0 for Render Free compatibility
+const host = '0.0.0.0';
+httpServer.listen(config.port, host, () => {
+    log('INFO', 'SERVER', `Server listening on ${host}:${config.port}`, {
+        port: config.port,
+        frontendOrigin: config.frontendOrigin,
+        env: config.nodeEnv,
     });
 });
 // Graceful Shutdown handling
-function handleShutdown(signal) {
-    log('INFO', `Received ${signal}. Initiating graceful shutdown...`);
+let isShuttingDown = false;
+async function handleShutdown(signal) {
+    if (isShuttingDown)
+        return;
+    isShuttingDown = true;
+    log('INFO', 'SERVER', `Received ${signal}. Initiating graceful shutdown...`);
     // Stop accepting new socket connections and disconnect active sockets
-    io.close(() => {
-        log('INFO', 'Socket.IO server closed.');
+    signaling.io.close(() => {
+        log('INFO', 'SERVER', 'Socket.IO server closed.');
     });
     // Close HTTP server
-    httpServer.close((err) => {
+    httpServer.close(async (err) => {
         if (err) {
-            log('ERROR', 'Error closing HTTP server:', { error: err.message });
-            process.exit(1);
+            log('ERROR', 'SERVER', 'Error closing HTTP server:', { error: err.message });
         }
-        log('INFO', 'HTTP server closed gracefully.');
-        process.exit(0);
+        else {
+            log('INFO', 'SERVER', 'HTTP server closed gracefully.');
+        }
+        try {
+            await prisma.$disconnect();
+            log('INFO', 'SERVER', 'Prisma database connection closed.');
+        }
+        catch (dbErr) {
+            log('ERROR', 'SERVER', 'Error disconnecting Prisma:', { error: dbErr.message });
+        }
+        process.exit(err ? 1 : 0);
     });
     // Force shutdown if cleanup takes longer than 10 seconds
     setTimeout(() => {
-        log('ERROR', 'Forced shutdown due to timeout.');
+        log('ERROR', 'SERVER', 'Forced shutdown due to timeout.');
         process.exit(1);
     }, 10000).unref();
 }
-process.on('SIGINT', () => handleShutdown('SIGINT'));
-process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => void handleShutdown('SIGINT'));
+process.on('SIGTERM', () => void handleShutdown('SIGTERM'));
+export { app, httpServer, signaling };
